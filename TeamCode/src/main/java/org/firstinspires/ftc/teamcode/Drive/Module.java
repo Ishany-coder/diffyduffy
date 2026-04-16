@@ -82,10 +82,9 @@ public class Module {
         double p = KP * error;
         i += (error * dt);
         i = Math.max(-1, Math.min(1, i));
-        i *= KI;
         double d = KD * ((error - lastError)/dt);
 
-        double steeringPower = p + i + d;
+        double steeringPower = p + KI * i + d;
 
         double pos = drivePower + steeringPower;
         double neg = drivePower - steeringPower;

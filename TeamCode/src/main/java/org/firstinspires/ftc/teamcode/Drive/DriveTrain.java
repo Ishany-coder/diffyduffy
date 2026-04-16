@@ -40,8 +40,8 @@ public class DriveTrain {
         }
     }
 
-        //angular rotation is in rad/s
-    // velocityvector in in/s
+    //angular rotation is in rad/s
+    // velocity vector in in/s
     public void update(Vector2d velocityVector, double angularRotation){
         List<Double> angles = new ArrayList<>();
         List<Double> speeds = new ArrayList<>();
