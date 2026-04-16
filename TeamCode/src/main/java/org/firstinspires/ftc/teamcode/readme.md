@@ -1,131 +1,188 @@
-## TeamCode Module
+# Differential Swerve Drive — TeamCode
 
-Welcome!
+A two-module differential swerve drive base for FTC, plus a
+robot-centric teleop test OpMode.
 
-This module, TeamCode, is the place where you will write/paste the code for your team's
-robot controller App. This module is currently empty (a clean slate) but the
-process for adding OpModes is straightforward.
+## Files
 
-## Creating your own OpModes
+| File | Purpose |
+| --- | --- |
+| `AnalogEncoder.java`     | Wrapper around a REV Through-Bore encoder wired in analog mode. Converts voltage → radians with optional offset / reversal. |
+| `Module.java`            | One swerve pod. Runs a PIDF heading loop and mixes steer + drive into two motor powers. |
+| `DriveTrain.java`        | Owns both modules. Holds tuning constants, runs the inverse kinematics, manages Lynx hub bulk caching. |
+| `DiffySwerveTeleOp.java` | TeleOp driver OpMode. Left stick = translation, right stick X = rotation. Robot-centric. |
 
-The easiest way to create your own OpMode is to copy a Sample OpMode and make it your own.
+## Hardware map names
 
-Sample opmodes exist in the FtcRobotController module.
-To locate these samples, find the FtcRobotController module in the "Project/Android" tab.
+| Hardware | Config name |
+| --- | --- |
+| Left module drive motors  | `motor1`, `motor2` |
+| Right module drive motors | `motor3`, `motor4` |
+| Left steer encoder        | `sensor1` (analog input) |
+| Right steer encoder       | `sensor2` (analog input) |
 
-Expand the following tree elements:
- FtcRobotController/java/org.firstinspires.ftc.robotcontroller/external/samples
+Change these in the `HARDWARE NAMES` block of `DriveTrain.java` if your config differs.
 
-### Naming of Samples
+---
 
-To gain a better understanding of how the samples are organized, and how to interpret the
-naming system, it will help to understand the conventions that were used during their creation.
+## How differential swerve works (mechanically)
 
-These conventions are described (in detail) in the sample_conventions.md file in this folder.
-
-To summarize: A range of different samples classes will reside in the java/external/samples.
-The class names will follow a naming convention which indicates the purpose of each class.
-The prefix of the name will be one of the following:
-
-Basic:  	This is a minimally functional OpMode used to illustrate the skeleton/structure
-            of a particular style of OpMode.  These are bare bones examples.
-
-Sensor:    	This is a Sample OpMode that shows how to use a specific sensor.
-            It is not intended to drive a functioning robot, it is simply showing the minimal code
-            required to read and display the sensor values.
-
-Robot:	    This is a Sample OpMode that assumes a simple two-motor (differential) drive base.
-            It may be used to provide a common baseline driving OpMode, or
-            to demonstrate how a particular sensor or concept can be used to navigate.
-
-Concept:	This is a sample OpMode that illustrates performing a specific function or concept.
-            These may be complex, but their operation should be explained clearly in the comments,
-            or the comments should reference an external doc, guide or tutorial.
-            Each OpMode should try to only demonstrate a single concept so they are easy to
-            locate based on their name.  These OpModes may not produce a drivable robot.
-
-After the prefix, other conventions will apply:
-
-* Sensor class names are constructed as:    Sensor - Company - Type
-* Robot class names are constructed as:     Robot - Mode - Action - OpModetype
-* Concept class names are constructed as:   Concept - Topic - OpModetype
-
-Once you are familiar with the range of samples available, you can choose one to be the
-basis for your own robot.  In all cases, the desired sample(s) needs to be copied into
-your TeamCode module to be used.
-
-This is done inside Android Studio directly, using the following steps:
-
- 1) Locate the desired sample class in the Project/Android tree.
-
- 2) Right click on the sample class and select "Copy"
-
- 3) Expand the  TeamCode/java folder
-
- 4) Right click on the org.firstinspires.ftc.teamcode folder and select "Paste"
-
- 5) You will be prompted for a class name for the copy.
-    Choose something meaningful based on the purpose of this class.
-    Start with a capital letter, and remember that there may be more similar classes later.
-
-Once your copy has been created, you should prepare it for use on your robot.
-This is done by adjusting the OpMode's name, and enabling it to be displayed on the
-Driver Station's OpMode list.
-
-Each OpMode sample class begins with several lines of code like the ones shown below:
+Each module has **two motors** driving into a differential. The differential has two
+outputs: the **wheel** (rolling) and the **module housing** (steering yaw). The two
+motor speeds `ω1` and `ω2` mix into those outputs linearly:
 
 ```
- @TeleOp(name="Template: Linear OpMode", group="Linear Opmode")
- @Disabled
+steer_rate    ∝ (ω1 + ω2) / 2     ← both motors same direction rotates the pod
+wheel_rate    ∝ (ω1 - ω2) / 2     ← motors opposite drives the wheel
 ```
 
-The name that will appear on the driver station's "opmode list" is defined by the code:
- ``name="Template: Linear OpMode"``
-You can change what appears between the quotes to better describe your opmode.
-The "group=" portion of the code can be used to help organize your list of OpModes.
+So if both motors spin the same way the module just *turns*; if they spin opposite
+ways the wheel *rolls* without steering; any other combination does both at once.
+The code inverts this mix to command the motors:
 
-As shown, the current OpMode will NOT appear on the driver station's OpMode list because of the
-  ``@Disabled`` annotation which has been included.
-This line can simply be deleted , or commented out, to make the OpMode visible.
+```
+m1 = steer + drive
+m2 = steer - drive
+```
 
+where `steer` is the PIDF output that closes the heading loop and `drive` is a
+feed-forward from the requested wheel speed.
 
+---
 
-## ADVANCED Multi-Team App management:  Cloning the TeamCode Module
+## Inverse kinematics (chassis → modules)
 
-In some situations, you have multiple teams in your club and you want them to all share
-a common code organization, with each being able to *see* the others code but each having
-their own team module with their own code that they maintain themselves.
+Coordinate frame used by `DriveTrain` (matches `Vector2d` in the code):
 
-In this situation, you might wish to clone the TeamCode module, once for each of these teams.
-Each of the clones would then appear along side each other in the Android Studio module list,
-together with the FtcRobotController module (and the original TeamCode module).
+```
++x  →  robot right
++y  →  robot forward
++ω  →  clockwise when viewed from above
+```
 
-Selective Team phones can then be programmed by selecting the desired Module from the pulldown list
-prior to clicking to the green Run arrow.
+Given a desired chassis twist `(vx, vy, ω)` and a module at pose `(rx, ry)`
+relative to the center, the module's world-frame velocity is:
 
-Warning:  This is not for the inexperienced Software developer.
-You will need to be comfortable with File manipulations and managing Android Studio Modules.
-These changes are performed OUTSIDE of Android Studios, so close Android Studios before you do this.
- 
-Also.. Make a full project backup before you start this :)
+```
+vx_i = vx + ω * ry_i
+vy_i = vy - ω * rx_i
+```
 
-To clone TeamCode, do the following:
+From there we extract the module's target heading and wheel speed:
 
-Note: Some names start with "Team" and others start with "team".  This is intentional.
+```
+θ_i     = atan2(vy_i, vx_i)
+speed_i = hypot(vx_i, vy_i)
+```
 
-1)  Using your operating system file management tools, copy the whole "TeamCode"
-    folder to a sibling folder with a corresponding new name, eg: "Team0417".
+`DriveTrain.update()` runs this for each module then **desaturates**: if any
+`speed_i` exceeds the theoretical free-wheel speed, every module's speed is
+scaled down by the same factor so the robot's direction of motion is preserved.
 
-2)  In the new Team0417 folder, delete the TeamCode.iml file.
+### Free-speed cap
 
-3)  the new Team0417 folder, rename the "src/main/java/org/firstinspires/ftc/teamcode" folder
-    to a matching name with a lowercase 'team' eg:  "team0417".
+```
+MAX_INCHES_PER_SEC = (MOTOR_MAX_RPM * DRIVE_GEAR_RATIO / 60) * π * WHEEL_DIAMETER_IN
+MAX_RAD_PER_SEC    = MAX_INCHES_PER_SEC / distance(center → module)
+```
 
-4)  In the new Team0417/src/main folder, edit the "AndroidManifest.xml" file, change the line that contains
-         package="org.firstinspires.ftc.teamcode"
-    to be
-         package="org.firstinspires.ftc.team0417"
+These are derived from the constants at the top of `DriveTrain.java`. **Tune those
+constants to your actual drivetrain** or the kinematics will misreport what the
+robot can do.
 
-5)  Add:    include ':Team0417' to the "/settings.gradle" file.
-    
-6)  Open up Android Studios and clean out any old files by using the menu to "Build/Clean Project""
+---
+
+## Module heading control (PIDF)
+
+`Module.update(targetAngle, targetSpeed)` closes the steering loop every cycle:
+
+1. Read current heading from the analog encoder.
+2. Compute wrapped error `err = atan2(sin(target − heading), cos(target − heading))`.
+   The `atan2(sin, cos)` trick normalizes angle differences to `(-π, π]`, which
+   eliminates the "358° vs 2°" problem.
+3. **Shortest-path optimization.** If `|err| > 90°` the module would take the long
+   way around. Instead we add π to the target, invert the drive command, and let
+   the wheel spin backwards — mechanically equivalent, but cuts the steering
+   rotation in half.
+4. Compute `steer = kP·err + kI·∫err dt + kD·(Δerr/Δt) + kF·sign(err)`. The `kF`
+   term is an optional static-friction breakaway.
+5. Convert requested wheel speed to a feed-forward power using the free-wheel
+   speed from above.
+6. Combine `m1 = steer + drive`, `m2 = steer − drive`, then desaturate so
+   `|m1|,|m2| ≤ 1`.
+
+### PIDF tuning starting point
+
+Default gains in `Module.java`:
+
+```
+kP = 0.6   kI = 0.0   kD = 0.03   kF = 0.0
+```
+
+Tune on the real bot: raise `kP` until you see oscillation, then add `kD` to
+damp it. Add a touch of `kF` only if a stationary module needs a nudge to break
+static friction. `kI` is rarely needed for a swerve pod.
+
+---
+
+## AnalogEncoder
+
+REV Through-Bore encoders in analog mode output `0 .. Vmax` over one full
+revolution. The class reads the voltage, normalizes it by `getMaxVoltage()`,
+scales to `0..2π`, applies an optional offset (mount angle) and reversal flag,
+and wraps to `(-π, π]`:
+
+```java
+frac = voltage / maxVoltage
+raw  = frac * 2π                // reverse if encoder is mirrored
+θ    = wrap(raw - offset)       // offset = module angle when voltage = 0
+```
+
+**Zeroing procedure:** park each module pointing straight forward, read
+`getAngleInRad()`, call `setOffset(thatValue)`. (The drivetrain exposes each
+encoder via `getLeftModule().getEncoder()` so you can wire this into an init
+step when you're ready.)
+
+---
+
+## Manual bulk reading
+
+`DriveTrain` grabs every `LynxModule` (both Control and Expansion hubs) and
+sets them to `BulkCachingMode.MANUAL`. At the top of every `update()` call
+`clearBulkCache()` fires once, so every subsequent encoder / motor read that
+loop hits the cache instead of the bus. This keeps the control loop fast
+regardless of how many sensors the rest of the robot adds later.
+
+---
+
+## TeleOp controls
+
+`DiffySwerveTeleOp`, robot-centric:
+
+| Input | Meaning |
+| --- | --- |
+| Left stick X   | Strafe right (+) / left  (−) |
+| Left stick Y   | Forward (+, stick is inverted internally) / reverse (−) |
+| Right stick X  | Rotate CW (+) / CCW (−) |
+
+Stick values are scaled by `MAX_INCHES_PER_SEC` and `MAX_RAD_PER_SEC` from
+`DriveTrain`, then passed through small deadbands. `TRANSLATION_SCALE` and
+`ROTATION_SCALE` cap peak output while drivers get used to the chassis.
+
+Telemetry shows commanded velocity and live module headings so you can verify
+the modules snap to the expected angles when you push the stick in a direction.
+
+---
+
+## What still needs tuning / wiring
+
+- Real values for `MOTOR_MAX_RPM`, `WHEEL_DIAMETER_IN`, `DRIVE_GEAR_RATIO`,
+  and the module positions in `DriveTrain.java`.
+- Encoder offsets (`AnalogEncoder.setOffset`) for each module — call once per
+  robot after mounting.
+- Encoder reversal (`setReversed(true)`) if a module reports decreasing angle
+  when you rotate it CCW.
+- PIDF gains on the real robot.
+- Second-order kinematics (acceleration feed-forward) and wheel-turn-time
+  compensation are not yet implemented — the current loop treats each frame
+  as an instantaneous target.
