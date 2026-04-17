@@ -67,8 +67,7 @@ public class ExampleAuto extends LinearOpMode {
             ));
             runUntilDone(planner);
 
-            // Done — hold position until OpMode ends
-            planner.stop();
+            planner.update();
             telemetry.addLine("Auto complete.");
             telemetry.update();
         }

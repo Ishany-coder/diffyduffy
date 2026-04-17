@@ -53,9 +53,11 @@ import com.qualcomm.robotcore.eventloop.opmode.LinearOpMode;
  * ═══════════════════════════════════════════════════════════════════════
  *  TEST 6 — SQUARE PATH (pure pursuit)
  *    The robot follows a 36-inch square path using pure pursuit.
- *    Tune Follower.LOOKAHEAD_IN and check path-tracking accuracy.
- *    Larger lookahead = smoother but cuts corners.
- *    Smaller lookahead = tighter tracking but can oscillate.
+ *    Tune Follower.LOOKAHEAD_MIN / LOOKAHEAD_MAX / LOOKAHEAD_GAIN and check
+ *    path-tracking accuracy. Lookahead scales with commanded speed:
+ *      L = clamp(LOOKAHEAD_MIN + LOOKAHEAD_GAIN · v_target, MIN, MAX).
+ *    Larger L = smoother but cuts corners. Smaller L = tighter but oscillates.
+ *    Also tune MAX_LAT_ACCEL (centripetal cap) and SPLINE_TENSION.
  *
  * ═══════════════════════════════════════════════════════════════════════
  *  TEST 7 — REPEATABILITY

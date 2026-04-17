@@ -5,358 +5,377 @@ import com.acmerobotics.roadrunner.Vector2d;
 
 import org.firstinspires.ftc.teamcode.Drive.DriveTrain;
 
-import java.util.ArrayList;
 import java.util.List;
 
 /**
  * Autonomous path follower for the differential-swerve drivetrain.
  *
- * Two modes of operation:
+ * Pipeline on {@link #followPath(List)}:
+ *   1. Build a C1-continuous piecewise cubic Bézier spline through the
+ *      user's waypoints (Catmull-Rom tangents).
+ *   2. Dense-sample it by arc length, carrying (x, y, tangent, κ) per sample.
+ *   3. Run a curvature-aware velocity profile (forward/backward sweeps with
+ *      the friction-circle constraint — see {@link MotionProfile}).
+ *   4. Drive it via adaptive pure pursuit: lookahead scales with commanded
+ *      speed, the lookahead point is pulled from the spline directly.
+ *   5. Within {@link #PATH_END_THRESH} of the final waypoint, hand off to a
+ *      terminal go-to-point controller for a precise finish.
  *
- *   1) GO-TO-POINT — PIDF on each robot-frame axis with trapezoidal motion
- *      profiling.  Best for precise positioning and holding a target pose.
+ * Terminal / go-to-point controller is swappable via {@link #USE_PID}:
+ *   true  → translational PIDF + heading PID  ("tunable everything" mode)
+ *   false → SQuID on both translation and heading (fewer knobs, fast settle)
  *
- *   2) PURE PURSUIT — follows a list of waypoints using a lookahead circle.
- *      Produces smoother, faster paths through a sequence of points.  When the
- *      robot is within {@link #PATH_END_THRESHOLD_IN} of the final waypoint the
- *      follower automatically switches to go-to-point for a precise finish.
+ * Heading along a path is one of {@link HeadingMode}:
+ *   TANGENT   — face along the path tangent
+ *   CONSTANT  — hold the last waypoint's heading throughout
+ *   LINEAR    — interpolate between waypoint headings by arc length (default)
  *
- * Because this is a swerve drive, translation and heading are fully decoupled:
- * the robot can move in any direction while independently controlling its
- * heading.  The follower exploits this by running separate PID loops for
- * (x, y) translation and heading.
- *
- * Typical usage:
- * <pre>
- *   follower.goToPoint(new Pose2d(24, 0, 0));
- *   while (opModeIsActive() && follower.isBusy()) {
- *       follower.update();
- *   }
- * </pre>
+ * Loop-lag compensation: every update predicts the pose {@link #LOOP_TIME_MS}
+ * into the future (current pose + velocity · dt) so that the command we send
+ * now is consistent with where the robot will actually be when the command
+ * takes effect.
  */
 @Config
 public class Follower {
 
-    // ==================== TRANSLATIONAL PID ====================
+    // ==================== TUNING VARIABLES ====================
+
+    /** true → translational PIDF + heading PID. false → SQuID on both. */
+    public static boolean USE_PID = true;
+
+    // --- Translational PIDF (used when USE_PID = true) ---
     public static double TRANS_KP = 0.15;
     public static double TRANS_KI = 0.01;
     public static double TRANS_KD = 0.02;
-    /** Static feedforward — just enough power to overcome carpet friction. */
     public static double TRANS_KF = 0.03;
 
-    // ==================== HEADING PID ==========================
-    public static double HEAD_KP  = 1.5;
-    public static double HEAD_KI  = 0.005;
-    public static double HEAD_KD  = 0.1;
+    // --- Heading PID (used when USE_PID = true) ---
+    public static double HEAD_KP = 1.5;
+    public static double HEAD_KI = 0.005;
+    public static double HEAD_KD = 0.10;
 
-    // ==================== TOLERANCES ===========================
-    /** Position error (inches) below which the follower reports "at target". */
+    // --- SQuID gains (used when USE_PID = false, and by squidGoToPoint) ---
+    // output = Kp · sign(e) · √|e|. Tune so Kp·√(typical error) ≈ desired speed.
+    // e.g. for 60 in/s at 100 in: Kp ≈ 60/√100 = 6.
+    public static double TRANS_SQUID_KP = 6.0;
+    public static double HEAD_SQUID_KP  = 4.0;
+
+    // --- Tolerances ---
     public static double POS_TOLERANCE_IN   = 0.5;
-    /** Heading error (rad) below which the follower reports "at target". */
     public static double HEAD_TOLERANCE_RAD = Math.toRadians(2.0);
 
-    // ==================== MOTION PROFILE =======================
-    /** Maximum translational acceleration (in/s²) during the ramp-up phase. */
-    public static double MAX_ACCEL  = 40.0;
-    /** Maximum translational deceleration (in/s²) near the target. */
-    public static double MAX_DECEL  = 60.0;
-    /**
-     * Minimum creep speed (in/s) so the robot doesn't stall when close to
-     * the target but not yet inside tolerance.
-     */
-    public static double MIN_SPEED  = 2.0;
+    // --- Motion constraints (profile & go-to-point) ---
+    public static double MAX_VEL       = 60.0;  // in/s — auto-clamped to drivetrain top speed
+    public static double MAX_ACCEL     = 40.0;  // in/s² tangential accel budget
+    public static double MAX_DECEL     = 60.0;  // in/s² tangential decel budget
+    public static double MAX_LAT_ACCEL = 30.0;  // in/s² centripetal cap (tire/carpet friction)
+    public static double MIN_SPEED     = 2.0;   // in/s floor so we don't stall outside tolerance
 
-    // ==================== PURE PURSUIT =========================
-    /** Lookahead distance for the circle-line intersection (inches). */
-    public static double LOOKAHEAD_IN = 10.0;
-    /**
-     * When the robot is closer than this to the last waypoint, the follower
-     * switches from pure pursuit to go-to-point for a precise finish.
-     */
-    public static double PATH_END_THRESH = 3.0;
+    // --- Pure pursuit ---
+    public static double LOOKAHEAD_MIN  = 4.0;   // in
+    public static double LOOKAHEAD_MAX  = 18.0;  // in
+    public static double LOOKAHEAD_GAIN = 0.35;  // s  (L = min + gain · v_target)
+    public static double PATH_END_THRESH = 3.0;  // in, switch to terminal phase
 
-    // ==================== INTERNALS ============================
+    // --- Spline ---
+    public static double SPLINE_TENSION      = 0.5;  // 0 = polyline, 0.5 = Catmull-Rom
+    public static int SAMPLES_PER_SEGMENT = 60;   // arc-length sampling density
+
+    // --- Loop-lag compensation ---
+    /** One FTC loop period in milliseconds. Pose is projected this far forward. */
+    public static double LOOP_TIME_MS = 15.0;
+
+    /** Default heading mode for followPath(). */
+    public static HeadingMode DEFAULT_HEADING_MODE = HeadingMode.LINEAR;
+
+    // ==================== PUBLIC TYPES ========================
+
+    public enum HeadingMode { TANGENT, CONSTANT, LINEAR }
+
+    private enum Mode { IDLE, GO_TO_POINT, SQUID_GO_TO_POINT, FOLLOW_PATH }
+
+    // ==================== INTERNALS ===========================
 
     private final DriveTrain drive;
     private final ThreeWheelOdometry odometry;
 
-    private final PIDFController xPID;
-    private final PIDFController yPID;
-    private final PIDFController headingPID;
+    private final PIDFController xPID, yPID, headingPID;
+    private final SquIDController transSquid, headingSquid;
 
-    private Pose2d targetPose;
-    private List<Pose2d> path;
-    private int closestIdx;
-
-    private enum Mode { IDLE, GO_TO_POINT, PURE_PURSUIT }
     private Mode mode = Mode.IDLE;
+    private Pose2d targetPose;
 
-    /** Smoothly-ramped speed so we don't slam from 0 to max. */
+    // Path-following state
+    private BezierSpline path;
+    private MotionProfile profile;
+    private int cursorIdx;
+    private HeadingMode headingMode = HeadingMode.LINEAR;
+
+    // Go-to-point profile state
     private double profiledSpeed;
 
+    // External speed cap (setMaxSpeed)
     private double maxSpeed;
 
     // ==================== CONSTRUCTION =========================
 
     public Follower(DriveTrain drive, ThreeWheelOdometry odometry) {
-        this.drive    = drive;
+        this.drive = drive;
         this.odometry = odometry;
         this.maxSpeed = drive.MAX_INCHES_PER_SEC;
 
         xPID       = new PIDFController(TRANS_KP, TRANS_KI, TRANS_KD, TRANS_KF);
         yPID       = new PIDFController(TRANS_KP, TRANS_KI, TRANS_KD, TRANS_KF);
         headingPID = new PIDFController(HEAD_KP,  HEAD_KI,  HEAD_KD);
+        transSquid   = new SquIDController(TRANS_SQUID_KP);
+        headingSquid = new SquIDController(HEAD_SQUID_KP);
     }
 
     // ==================== PUBLIC API ===========================
 
-    /**
-     * Drive to a single target pose using PIDF control + motion profiling.
-     * Call {@link #update()} in a loop until {@link #isBusy()} returns false.
-     */
+    /** Go-to-point using the active controller (PID when USE_PID, SQuID otherwise). */
     public void goToPoint(Pose2d target) {
-        this.targetPose    = target;
-        this.mode          = Mode.GO_TO_POINT;
+        this.targetPose = target;
+        this.mode = USE_PID ? Mode.GO_TO_POINT : Mode.SQUID_GO_TO_POINT;
         this.profiledSpeed = 0;
-        resetPIDs();
+        resetControllers();
     }
 
-    /**
-     * Follow a sequence of waypoints using pure pursuit, finishing with
-     * precise go-to-point positioning at the last waypoint.
-     */
+    /** Force SQuID go-to-point, regardless of USE_PID. */
+    public void squidGoToPoint(Pose2d target) {
+        this.targetPose = target;
+        this.mode = Mode.SQUID_GO_TO_POINT;
+        resetControllers();
+    }
+
+    /** Follow a path using the default heading mode. */
     public void followPath(List<Pose2d> waypoints) {
-        this.path          = new ArrayList<>(waypoints);
-        this.targetPose    = waypoints.get(waypoints.size() - 1);
-        this.closestIdx    = 0;
-        this.mode          = Mode.PURE_PURSUIT;
-        this.profiledSpeed = 0;
-        resetPIDs();
+        followPath(waypoints, DEFAULT_HEADING_MODE);
     }
 
-    /**
-     * Run one control-loop iteration.  Reads odometry, computes drive
-     * commands, and sends them to the drivetrain.  Must be called every loop.
-     */
+    /** Follow a path with an explicit heading mode. */
+    public void followPath(List<Pose2d> waypoints, HeadingMode hMode) {
+        double vCap = Math.min(Math.min(MAX_VEL, maxSpeed), drive.MAX_INCHES_PER_SEC);
+        this.path    = new BezierSpline(waypoints, SPLINE_TENSION, SAMPLES_PER_SEGMENT);
+        this.profile = new MotionProfile(
+                path, vCap, MAX_ACCEL, MAX_DECEL, MAX_LAT_ACCEL,
+                /*entrySpeed*/ 0, /*exitSpeed*/ 0);
+        this.targetPose  = waypoints.get(waypoints.size() - 1);
+        this.cursorIdx   = 0;
+        this.headingMode = hMode;
+        this.mode        = Mode.FOLLOW_PATH;
+        this.profiledSpeed = 0;
+        resetControllers();
+    }
+
+    /** One control-loop iteration. Must be called every loop. */
     public void update() {
         odometry.update();
-        Pose2d current = odometry.getPose();
+        refreshGains();
 
-        // Hot-reload PID gains from Dashboard
-        xPID.setCoefficients(TRANS_KP, TRANS_KI, TRANS_KD, TRANS_KF);
-        yPID.setCoefficients(TRANS_KP, TRANS_KI, TRANS_KD, TRANS_KF);
-        headingPID.setCoefficients(HEAD_KP, HEAD_KI, HEAD_KD, 0);
+        Pose2d predicted = predictedPose();
 
         switch (mode) {
-            case GO_TO_POINT:
-                runGoToPoint(current);
-                break;
-            case PURE_PURSUIT:
-                runPurePursuit(current);
-                break;
-            default:
-                drive.update(new Vector2d(0, 0), 0);
-                break;
+            case GO_TO_POINT:       runPidGoToPoint(predicted);   break;
+            case SQUID_GO_TO_POINT: runSquidGoToPoint(predicted); break;
+            case FOLLOW_PATH:       runFollowPath(predicted);     break;
+            default: drive.update(new Vector2d(0, 0), 0);
         }
     }
 
-    /** True while the follower has not yet reached the target within tolerance. */
     public boolean isBusy() {
         if (mode == Mode.IDLE) return false;
         Pose2d cur = odometry.getPose();
         return cur.distanceTo(targetPose) > POS_TOLERANCE_IN
             || Math.abs(Pose2d.normalizeAngle(targetPose.heading - cur.heading))
-               > HEAD_TOLERANCE_RAD;
+                > HEAD_TOLERANCE_RAD;
     }
 
-    /** Immediately stop and go idle. */
     public void stop() {
         mode = Mode.IDLE;
         drive.update(new Vector2d(0, 0), 0);
     }
 
-    public Pose2d getCurrentPose() {
-        return odometry.getPose();
-    }
+    public Pose2d getCurrentPose()   { return odometry.getPose(); }
+    public Pose2d getPredictedPose() { return predictedPose(); }
+    public void setMaxSpeed(double inPerSec) { this.maxSpeed = inPerSec; }
 
-    /** Cap the translational speed (useful for careful movements). */
-    public void setMaxSpeed(double inPerSec) {
-        this.maxSpeed = inPerSec;
-    }
+    // ==================== FOLLOW_PATH ==========================
 
-    // ==================== GO-TO-POINT ==========================
+    private void runFollowPath(Pose2d current) {
+        cursorIdx = path.closestIndex(current.x, current.y, cursorIdx);
+        BezierSpline.Sample closest = path.get(cursorIdx);
 
-    private void runGoToPoint(Pose2d current) {
-        double errFieldX = targetPose.x - current.x;
-        double errFieldY = targetPose.y - current.y;
-        double dist = Math.hypot(errFieldX, errFieldY);
-        double errH = Pose2d.normalizeAngle(targetPose.heading - current.heading);
-
-        // --- Trapezoidal motion profile on translational speed ---
-        double desiredSpeed = profileSpeed(dist);
-
-        // --- Rotate field-frame error into robot frame ---
-        double cos = Math.cos(-current.heading);
-        double sin = Math.sin(-current.heading);
-        double robotErrX = errFieldX * cos - errFieldY * sin;
-        double robotErrY = errFieldX * sin + errFieldY * cos;
-
-        // --- PIDF on each robot-frame axis ---
-        double vx = 0, vy = 0;
-        if (dist > 0.1) {
-            vx = xPID.calculate(robotErrX);
-            vy = yPID.calculate(robotErrY);
-
-            // Clamp resultant speed to the profiled maximum
-            double rawSpeed = Math.hypot(vx, vy);
-            if (rawSpeed > desiredSpeed) {
-                double scale = desiredSpeed / rawSpeed;
-                vx *= scale;
-                vy *= scale;
-            }
-        }
-
-        // --- Heading PIDF (output is rad/s) ---
-        double omega = headingPID.calculate(errH);
-        omega = clamp(omega, -drive.MAX_RAD_PER_SEC, drive.MAX_RAD_PER_SEC);
-
-        drive.update(new Vector2d(vx, vy), omega);
-    }
-
-    // ==================== PURE PURSUIT =========================
-
-    private void runPurePursuit(Pose2d current) {
-        advanceClosestIndex(current);
-
-        // Near the end of the path? Switch to precise positioning.
-        double distEnd = current.distanceTo(targetPose);
-        if (distEnd < PATH_END_THRESH) {
-            mode = Mode.GO_TO_POINT;
-            runGoToPoint(current);
+        // Terminal phase — precise finish via go-to-point
+        double straightToEnd = current.distanceTo(targetPose);
+        if (straightToEnd < PATH_END_THRESH) {
+            mode = USE_PID ? Mode.GO_TO_POINT : Mode.SQUID_GO_TO_POINT;
+            if (mode == Mode.GO_TO_POINT) runPidGoToPoint(current);
+            else                          runSquidGoToPoint(current);
             return;
         }
 
-        Pose2d lookahead = findLookahead(current);
+        double vTarget = profile.at(cursorIdx);
 
-        double errX = lookahead.x - current.x;
-        double errY = lookahead.y - current.y;
-        double dist = Math.hypot(errX, errY);
-        double errH = Pose2d.normalizeAngle(lookahead.heading - current.heading);
+        // Adaptive lookahead: scales with commanded speed
+        double L = clamp(LOOKAHEAD_MIN + LOOKAHEAD_GAIN * vTarget,
+                         LOOKAHEAD_MIN, LOOKAHEAD_MAX);
+        double sLook = Math.min(closest.s + L, path.totalLength);
+        BezierSpline.Sample look = path.interpolateAt(sLook);
 
-        // Rotate to robot frame
-        double cos = Math.cos(-current.heading);
-        double sin = Math.sin(-current.heading);
-        double rx  = errX * cos - errY * sin;
-        double ry  = errX * sin + errY * cos;
+        double ex = look.x - current.x;
+        double ey = look.y - current.y;
+        double eNorm = Math.hypot(ex, ey);
 
-        // Profile speed based on distance to final target (slow near the end)
-        double speed = profileSpeed(distEnd);
-
-        if (dist > 0.1) {
-            rx = rx / dist * speed;
-            ry = ry / dist * speed;
+        double vxField = 0, vyField = 0;
+        if (eNorm > 1e-6) {
+            vxField = ex / eNorm * vTarget;
+            vyField = ey / eNorm * vTarget;
         }
 
-        double omega = headingPID.calculate(errH);
-        omega = clamp(omega, -drive.MAX_RAD_PER_SEC, drive.MAX_RAD_PER_SEC);
+        double cos = Math.cos(-current.heading);
+        double sin = Math.sin(-current.heading);
+        double rvx = vxField * cos - vyField * sin;
+        double rvy = vxField * sin + vyField * cos;
 
-        drive.update(new Vector2d(rx, ry), omega);
+        double hTarget = targetHeading(closest);
+        double eH = Pose2d.normalizeAngle(hTarget - current.heading);
+        double omega = clamp(headingControl(eH),
+                             -drive.MAX_RAD_PER_SEC, drive.MAX_RAD_PER_SEC);
+
+        drive.update(new Vector2d(rvx, rvy), omega);
     }
 
-    /** Walk the closest-point index forward (never backward) along the path. */
-    private void advanceClosestIndex(Pose2d current) {
-        double best = Double.MAX_VALUE;
-        for (int i = closestIdx; i < path.size(); i++) {
-            double d = current.distanceTo(path.get(i));
-            if (d < best) {
-                best = d;
-                closestIdx = i;
+    private double targetHeading(BezierSpline.Sample closest) {
+        switch (headingMode) {
+            case TANGENT:
+                return closest.tangent;
+            case CONSTANT:
+                return targetPose.heading;
+            case LINEAR:
+            default: {
+                double s = closest.s;
+                double[] ws = path.waypointS;
+                List<Pose2d> wp = path.waypoints;
+                for (int i = 1; i < ws.length; i++) {
+                    if (s <= ws[i]) {
+                        double span = ws[i] - ws[i - 1];
+                        double t = span < 1e-9 ? 0 : (s - ws[i - 1]) / span;
+                        double h0 = wp.get(i - 1).heading;
+                        double dh = Pose2d.normalizeAngle(wp.get(i).heading - h0);
+                        return h0 + t * dh;
+                    }
+                }
+                return targetPose.heading;
             }
         }
     }
 
-    /**
-     * Standard pure-pursuit lookahead: walk segments from the closest point
-     * and return the first intersection of a circle (radius = LOOKAHEAD_IN)
-     * centered on the robot with the path.  Falls back to the last waypoint.
-     */
-    private Pose2d findLookahead(Pose2d current) {
-        for (int i = closestIdx; i < path.size() - 1; i++) {
-            Pose2d hit = segCircleIntersection(
-                    current, path.get(i), path.get(i + 1), LOOKAHEAD_IN);
-            if (hit != null) return hit;
+    // ==================== PID GO-TO-POINT ======================
+
+    private void runPidGoToPoint(Pose2d current) {
+        double ex = targetPose.x - current.x;
+        double ey = targetPose.y - current.y;
+        double dist = Math.hypot(ex, ey);
+        double eH = Pose2d.normalizeAngle(targetPose.heading - current.heading);
+
+        // Trapezoidal speed cap. The decel branch uses v² = 2·a·Δs — v vs d is
+        // a parabola, not a line. That "quadratic" shape is what stops smoothly.
+        double cap = profileSpeed(dist);
+
+        double cos = Math.cos(-current.heading);
+        double sin = Math.sin(-current.heading);
+        double rex = ex * cos - ey * sin;
+        double rey = ex * sin + ey * cos;
+
+        double vx = 0, vy = 0;
+        if (dist > 1e-6) {
+            vx = xPID.calculate(rex);
+            vy = yPID.calculate(rey);
+            double mag = Math.hypot(vx, vy);
+            if (mag > cap) {
+                double s = cap / mag;
+                vx *= s; vy *= s;
+            }
         }
-        return path.get(path.size() - 1);
+
+        double omega = clamp(headingPID.calculate(eH),
+                             -drive.MAX_RAD_PER_SEC, drive.MAX_RAD_PER_SEC);
+        drive.update(new Vector2d(vx, vy), omega);
     }
 
-    /**
-     * Line-segment / circle intersection.  Returns the intersection closest
-     * to {@code segEnd} (i.e. furthest along the path), or null.
-     */
-    private static Pose2d segCircleIntersection(
-            Pose2d center, Pose2d segStart, Pose2d segEnd, double r) {
-        double dx = segEnd.x - segStart.x;
-        double dy = segEnd.y - segStart.y;
-        double fx = segStart.x - center.x;
-        double fy = segStart.y - center.y;
+    // ==================== SQuID GO-TO-POINT ====================
 
-        double a = dx * dx + dy * dy;
-        double b = 2 * (fx * dx + fy * dy);
-        double c = fx * fx + fy * fy - r * r;
-        double disc = b * b - 4 * a * c;
+    private void runSquidGoToPoint(Pose2d current) {
+        double ex = targetPose.x - current.x;
+        double ey = targetPose.y - current.y;
+        double dist = Math.hypot(ex, ey);
+        double eH = Pose2d.normalizeAngle(targetPose.heading - current.heading);
 
-        if (disc < 0) return null;
+        // SQuID scalar speed command, clamped by drivetrain cap and decel curve.
+        // Decel: v ≤ √(2·A·d) — quadratic kinematic stopping curve.
+        double speed = Math.abs(transSquid.calculate(dist));
+        speed = Math.min(speed, maxSpeed);
+        double decelCap = Math.sqrt(2 * MAX_DECEL * Math.max(dist, 0));
+        speed = Math.min(speed, decelCap);
+        if (dist > POS_TOLERANCE_IN) speed = Math.max(speed, MIN_SPEED);
 
-        double sq = Math.sqrt(disc);
-        double t1 = (-b - sq) / (2 * a);
-        double t2 = (-b + sq) / (2 * a);
+        double vxField = 0, vyField = 0;
+        if (dist > 1e-6) {
+            vxField = ex / dist * speed;
+            vyField = ey / dist * speed;
+        }
 
-        // Pick the furthest-along intersection that lies on the segment [0,1]
-        double t = -1;
-        if (t2 >= 0 && t2 <= 1) t = t2;
-        else if (t1 >= 0 && t1 <= 1) t = t1;
-        if (t < 0) return null;
+        double cos = Math.cos(-current.heading);
+        double sin = Math.sin(-current.heading);
+        double rvx = vxField * cos - vyField * sin;
+        double rvy = vxField * sin + vyField * cos;
 
-        double ix = segStart.x + t * dx;
-        double iy = segStart.y + t * dy;
-        // Linearly interpolate heading between the two waypoints
-        double ih = segStart.heading
-                  + t * Pose2d.normalizeAngle(segEnd.heading - segStart.heading);
-        return new Pose2d(ix, iy, ih);
+        double omega = clamp(headingSquid.calculate(eH),
+                             -drive.MAX_RAD_PER_SEC, drive.MAX_RAD_PER_SEC);
+        drive.update(new Vector2d(rvx, rvy), omega);
     }
 
-    // ==================== MOTION PROFILING =====================
+    // ==================== SHARED HELPERS =======================
 
-    /**
-     * Trapezoidal-style speed profile.
-     *   - Ramps up from 0 at {@link #MAX_ACCEL}.
-     *   - Ramps down as sqrt(2 * MAX_DECEL * distance) near the target.
-     *   - Never drops below {@link #MIN_SPEED} so the robot doesn't stall
-     *     outside the tolerance zone.
-     */
+    private double headingControl(double errorRad) {
+        return USE_PID ? headingPID.calculate(errorRad)
+                       : headingSquid.calculate(errorRad);
+    }
+
+    /** Trapezoidal speed cap for stand-alone go-to-point. Linear accel ramp,
+     *  kinematic parabola v = √(2·A·d) on the decel side. */
     private double profileSpeed(double distToTarget) {
-        // Deceleration curve: the max speed we could be going and still stop in time
-        double decelLimit = Math.sqrt(2 * MAX_DECEL * distToTarget);
-
-        // Acceleration ramp (assume ~20 ms loop time)
-        double dt = 0.020;
+        double dt = LOOP_TIME_MS / 1000.0;
         profiledSpeed = Math.min(profiledSpeed + MAX_ACCEL * dt, maxSpeed);
-
-        double speed = Math.min(profiledSpeed, Math.min(decelLimit, maxSpeed));
-
-        // Floor so we don't stall while still outside tolerance
-        if (distToTarget > POS_TOLERANCE_IN) {
-            speed = Math.max(speed, MIN_SPEED);
-        }
+        double decelCap = Math.sqrt(2 * MAX_DECEL * Math.max(distToTarget, 0));
+        double speed = Math.min(profiledSpeed, Math.min(decelCap, maxSpeed));
+        if (distToTarget > POS_TOLERANCE_IN) speed = Math.max(speed, MIN_SPEED);
         return speed;
     }
 
-    // ==================== HELPERS ==============================
+    /** Pose projected LOOP_TIME_MS into the future using odometry velocity. */
+    private Pose2d predictedPose() {
+        double dt = LOOP_TIME_MS / 1000.0;
+        Pose2d p = odometry.getPose();
+        double px = p.x + odometry.getVelocityX() * dt;
+        double py = p.y + odometry.getVelocityY() * dt;
+        double ph = Pose2d.normalizeAngle(p.heading + odometry.getVelocityH() * dt);
+        return new Pose2d(px, py, ph);
+    }
 
-    private void resetPIDs() {
+    private void resetControllers() {
         xPID.reset();
         yPID.reset();
         headingPID.reset();
+    }
+
+    private void refreshGains() {
+        xPID.setCoefficients(TRANS_KP, TRANS_KI, TRANS_KD, TRANS_KF);
+        yPID.setCoefficients(TRANS_KP, TRANS_KI, TRANS_KD, TRANS_KF);
+        headingPID.setCoefficients(HEAD_KP, HEAD_KI, HEAD_KD, 0);
+        transSquid.setPID(TRANS_SQUID_KP);
+        headingSquid.setPID(HEAD_SQUID_KP);
     }
 
     private static double clamp(double v, double lo, double hi) {

@@ -31,4 +31,11 @@ public class Pose2d {
     public String toString() {
         return String.format("(%.2f, %.2f, %.1f°)", x, y, Math.toDegrees(heading));
     }
+
+    public double y() {
+        return this.y;
+    }
+    public double x(){
+        return this.x;
+    }
 }

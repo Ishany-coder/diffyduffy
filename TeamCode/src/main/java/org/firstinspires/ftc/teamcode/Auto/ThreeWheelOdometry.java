@@ -77,10 +77,7 @@ public class ThreeWheelOdometry {
      * @param rightName  hardware-map name for right parallel encoder
      * @param centerName hardware-map name for perpendicular (strafe) encoder
      */
-    public ThreeWheelOdometry(HardwareMap hwMap,
-                              String leftName,
-                              String rightName,
-                              String centerName) {
+    public ThreeWheelOdometry(HardwareMap hwMap, String leftName, String rightName, String centerName) {
         leftEncoder   = hwMap.get(DcMotorEx.class, leftName);
         rightEncoder  = hwMap.get(DcMotorEx.class, rightName);
         centerEncoder = hwMap.get(DcMotorEx.class, centerName);
@@ -128,10 +125,10 @@ public class ThreeWheelOdometry {
         double dx = dForward * cos - dStrafe * sin;
         double dy = dForward * sin + dStrafe * cos;
 
-        pose.x       += dx;
-        pose.y       += dy;
+        pose.x += dx;
+        pose.y += dy;
         pose.heading += dHeading;
-        pose.heading  = Pose2d.normalizeAngle(pose.heading);
+        pose.heading = Pose2d.normalizeAngle(pose.heading);
 
         // --- Velocity estimation (for feedforward / telemetry) ---
         long now = System.nanoTime();
